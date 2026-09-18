@@ -50,6 +50,10 @@ class MockSubsystem extends Subsystem {
   Future<void> finalDispose() async {
     lifecycleLog.add('finalDispose');
   }
+
+  void doSomething() {
+    assertNotDisposed();
+  }
 }
 
 class FailingDisposeSubsystem extends Subsystem {
@@ -84,6 +88,22 @@ class FailingInitSubsystem extends Subsystem {
   }
 }
 
+class FailingConstructSubsystem extends Subsystem {
+  bool disposeCalledOnFail = false;
+
+  FailingConstructSubsystem({required super.classDesc});
+
+  @override
+  void postConstruct(BuildServiceParameters params) {
+    throw StateError('Failed in postConstruct');
+  }
+
+  @override
+  Future<void> dispose() async {
+    disposeCalledOnFail = true;
+  }
+}
+
 class TrackingTypeDesc extends SubsystemTypeDesc {
   int initContextCount = 0;
   int disposeContextCount = 0;
@@ -108,10 +128,12 @@ class TrackingTypeDesc extends SubsystemTypeDesc {
 
 void main() {
   setUp(() async {
+    SubsystemInstanceRegistry.onLifecycleError = null;
     await SubsystemInstanceRegistry.clearAll();
   });
 
   tearDown(() async {
+    SubsystemInstanceRegistry.onLifecycleError = null;
     await SubsystemInstanceRegistry.clearAll();
   });
 
@@ -143,6 +165,9 @@ void main() {
         'postInitialize',
       ]));
 
+      // Should be usable before disposal
+      expect(() => instance.doSomething(), returnsNormally);
+
       // Teardown
       await SubsystemInstanceRegistry.removeSubsystemByIds('test.type', 'service_a');
       expect(instance.isDisposed, isTrue);
@@ -154,6 +179,9 @@ void main() {
         'dispose',
         'finalDispose',
       ]));
+
+      // L1: assertNotDisposed throws after disposal
+      expect(() => instance.doSomething(), throwsStateError);
     });
 
     test('disposal is idempotent and safe against repeated calls', () async {
@@ -180,7 +208,12 @@ void main() {
       expect(instance.lifecycleLog.length, equals(logLengthAfterFirstDispose));
     });
 
-    test('finalDispose is guaranteed even when dispose throws', () async {
+    test('B1: dispose errors do not propagate and are reported to onLifecycleError; finalDispose still runs', () async {
+      final errors = <Object>[];
+      SubsystemInstanceRegistry.onLifecycleError = (error, stack) {
+        errors.add(error);
+      };
+
       final classDesc = SubsystemClassDesc(
         serviceType: testTypeDesc,
         displayName: 'Failing Dispose Service',
@@ -198,14 +231,45 @@ void main() {
       expect(instance.isDisposed, isFalse);
       expect(instance.finalDisposeCalled, isFalse);
 
-      // Disposal should catch/throw but still execute finalDispose
-      await expectLater(
-        () => SubsystemInstanceRegistry.removeSubsystemByIds('test.type', 'failing_dispose'),
-        throwsStateError,
-      );
+      // Disposal should NOT throw, but report to onLifecycleError
+      await SubsystemInstanceRegistry.removeSubsystemByIds('test.type', 'failing_dispose');
 
       expect(instance.isDisposed, isTrue);
       expect(instance.finalDisposeCalled, isTrue);
+      expect(errors.length, equals(1));
+      expect(errors.first, isA<StateError>());
+    });
+
+    test('B2: clearAll continues teardown even when individual dispose throws', () async {
+      final failingDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'Failing',
+        description: 'Fails in dispose',
+        serviceClassId: 'fail_disp_1',
+        defaultBuilder: (params) async => FailingDisposeSubsystem(classDesc: params.classDescription),
+      );
+
+      final okDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'OK Service',
+        description: 'Disposes normally',
+        serviceClassId: 'ok_disp_2',
+        defaultBuilder: (params) async => MockSubsystem(classDesc: params.classDescription),
+      );
+
+      final factory = TSubsystemFactory<Subsystem>();
+      factory.addServices([
+        BuildServiceParameters(classDescription: failingDesc),
+        BuildServiceParameters(classDescription: okDesc),
+      ]);
+
+      final instances = await factory.registerSubsystems();
+      final okInstance = instances.firstWhere((i) => i.classDesc.serviceClassId == 'ok_disp_2') as MockSubsystem;
+
+      await SubsystemInstanceRegistry.clearAll();
+
+      expect(okInstance.isDisposed, isTrue);
+      expect(okInstance.lifecycleLog.contains('finalDispose'), isTrue);
     });
   });
 
@@ -251,7 +315,7 @@ void main() {
   });
 
   group('Type Context Lifecycle', () {
-    test('initializes and disposes type context exactly once without double disposal', () async {
+    test('B4: initializes and disposes type context idempotently', () async {
       final trackingType = TrackingTypeDesc(
         displayName: 'Tracking Type',
         description: 'Tracks context lifecycle',
@@ -284,8 +348,16 @@ void main() {
 
       expect(trackingType.initContextCount, equals(1));
       expect(trackingType.disposeContextCount, equals(0));
+      expect(trackingType.isTypeContextInitialized, isTrue);
+      expect(trackingType.isTypeContextDisposed, isFalse);
 
       // Clear all subsystems: must dispose type context exactly ONCE
+      await SubsystemInstanceRegistry.clearAll();
+      expect(trackingType.disposeContextCount, equals(1));
+      expect(trackingType.isTypeContextDisposed, isTrue);
+      expect(trackingType.isTypeContextInitialized, isFalse);
+
+      // Calling clear again should not double-dispose
       await SubsystemInstanceRegistry.clearAll();
       expect(trackingType.disposeContextCount, equals(1));
     });
@@ -314,15 +386,102 @@ void main() {
       expect(SubsystemInstanceRegistry.lastFailedRegistrations.contains(params), isTrue);
 
       // Verify the zombie instance was NOT left in the registry
-      final lookup = SubsystemInstanceRegistry.findSubsystemByIdsSync('test.type', 'failing_init');
+      final lookup = SubsystemInstanceRegistry.findSubsystemByIds('test.type', 'failing_init');
       expect(lookup, isNull);
+    });
+
+    test('L3: disposes instance when postConstruct throws during build', () async {
+      FailingConstructSubsystem? createdInstance;
+      final classDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'Failing Construct',
+        description: 'Fails construct',
+        serviceClassId: 'failing_construct',
+        defaultBuilder: (params) async {
+          final s = FailingConstructSubsystem(classDesc: params.classDescription);
+          createdInstance = s;
+          return s;
+        },
+      );
+
+      final factory = TSubsystemFactory<FailingConstructSubsystem>();
+      factory.addService(BuildServiceParameters(classDescription: classDesc));
+
+      await expectLater(
+        () => factory.registerSubsystems(),
+        throwsA(isA<SubsystemInitializationException>()),
+      );
+
+      expect(createdInstance, isNotNull);
+      expect(createdInstance!.disposeCalledOnFail, isTrue);
+      expect(SubsystemInstanceRegistry.findSubsystemByIds('test.type', 'failing_construct'), isNull);
+    });
+
+    test('B3: atomicBatch: true rolls back all previous instances on failure', () async {
+      final okDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'OK Service',
+        description: 'OK',
+        serviceClassId: 'ok_service_atomic',
+        defaultBuilder: (params) async => MockSubsystem(classDesc: params.classDescription),
+      );
+
+      final failDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'Fail Service',
+        description: 'Fails in init',
+        serviceClassId: 'fail_service_atomic',
+        defaultBuilder: (params) async => FailingInitSubsystem(classDesc: params.classDescription),
+      );
+
+      final factory = TSubsystemFactory();
+      factory.addService(BuildServiceParameters(classDescription: okDesc, isSynchronous: true));
+      factory.addService(BuildServiceParameters(classDescription: failDesc, isSynchronous: true));
+
+      await expectLater(
+        () => factory.registerSubsystems(atomicBatch: true),
+        throwsA(isA<SubsystemInitializationException>()),
+      );
+
+      // With atomicBatch: true, the previously successful ok_service_atomic must be rolled back
+      expect(SubsystemInstanceRegistry.findSubsystemByIds('test.type', 'ok_service_atomic'), isNull);
+    });
+
+    test('B3: atomicBatch: false leaves earlier successful instances active', () async {
+      final okDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'OK Service Non-Atomic',
+        description: 'OK',
+        serviceClassId: 'ok_service_non_atomic',
+        defaultBuilder: (params) async => MockSubsystem(classDesc: params.classDescription),
+      );
+
+      final failDesc = SubsystemClassDesc(
+        serviceType: testTypeDesc,
+        displayName: 'Fail Service',
+        description: 'Fails in init',
+        serviceClassId: 'fail_service_non_atomic',
+        defaultBuilder: (params) async => FailingInitSubsystem(classDesc: params.classDescription),
+      );
+
+      final factory = TSubsystemFactory();
+      factory.addService(BuildServiceParameters(classDescription: okDesc, isSynchronous: true));
+      factory.addService(BuildServiceParameters(classDescription: failDesc, isSynchronous: true));
+
+      await expectLater(
+        () => factory.registerSubsystems(atomicBatch: false),
+        throwsA(isA<SubsystemInitializationException>()),
+      );
+
+      // With atomicBatch: false, the ok service remains in registry
+      expect(SubsystemInstanceRegistry.findSubsystemByIds('test.type', 'ok_service_non_atomic'), isNotNull);
     });
   });
 
   group('Lookup and Factory API', () {
-    test('findSubsystemByIdsChecked throws SubsystemNotFoundException when absent', () async {
+    test('findSubsystemByIdsChecked throws SubsystemNotFoundException when absent', () {
       expect(
-        () async => await SubsystemInstanceRegistry.findSubsystemByIdsChecked('non_existent', 'none'),
+        () => SubsystemInstanceRegistry.findSubsystemByIdsChecked('non_existent', 'none'),
         throwsA(isA<SubsystemNotFoundException>()),
       );
     });
@@ -367,7 +526,7 @@ void main() {
 
       final instances = await factory.registerSubsystems();
       expect(instances, isEmpty);
-      expect(SubsystemInstanceRegistry.findSubsystemByIdsSync('test.type', 'disabled_class'), isNull);
+      expect(SubsystemInstanceRegistry.findSubsystemByIds('test.type', 'disabled_class'), isNull);
     });
   });
 }

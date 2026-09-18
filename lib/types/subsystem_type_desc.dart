@@ -21,36 +21,54 @@ class SubsystemTypeDesc {
   /// Whether multiple distinct subsystem classes can be registered under this type.
   final bool supportsMultipleClasses;
 
+  bool _isTypeContextInitialized = false;
+  bool _isTypeContextDisposed = false;
+
+  /// Whether [initializeTypeContext] has been called and completed.
+  bool get isTypeContextInitialized => _isTypeContextInitialized;
+
+  /// Whether [disposeTypeContext] has been called and completed.
+  bool get isTypeContextDisposed => _isTypeContextDisposed;
+
   bool isValid() => serviceTypeId.isNotEmpty;
 
-  @protected
   /// Lifecycle hook called when the first subsystem of this type is registered.
   /// Managed by the registry; should not be called directly.
+  @protected
   Future<void> initializeTypeContext() async {}
 
-  @protected
   /// Lifecycle hook called when the last subsystem of this type is disposed.
   /// Managed by the registry; should not be called directly.
+  @protected
   Future<void> disposeTypeContext() async {}
 
-  Future<void> _beginInitializeTypeContext() async => initializeTypeContext();
-  Future<void> _beginDisposeTypeContext() async => disposeTypeContext();
-
-  /// Synchronously retrieves the registry associated with this type.
-  SubsystemInstanceRegistryByTypeDesc getRegistrySync() {
-    final registry = SubsystemInstanceRegistry.findRegistryForTypeIdSync(serviceTypeId);
-    if (registry == null) {
-      throw SubsystemNotFoundException(
-        'No registry found for type ID: $serviceTypeId',
-        typeId: serviceTypeId,
-      );
+  /// Idempotent: only initializes once even if called multiple times.
+  Future<void> _beginInitializeTypeContext() async {
+    if (_isTypeContextInitialized) {
+      return;
     }
-    return registry;
+    await initializeTypeContext();
+    _isTypeContextInitialized = true;
+    _isTypeContextDisposed = false;
   }
 
-  /// Asynchronously retrieves the registry associated with this type.
-  Future<SubsystemInstanceRegistryByTypeDesc> get registry async {
-    final registry = await SubsystemInstanceRegistry.findRegistryForTypeId(serviceTypeId);
+  /// Idempotent: only disposes once even if called multiple times.
+  /// Resets [_isTypeContextInitialized] so the context can be re-initialized
+  /// if subsystems of this type are registered again later.
+  Future<void> _beginDisposeTypeContext() async {
+    if (_isTypeContextDisposed) {
+      return;
+    }
+    _isTypeContextDisposed = true;
+    _isTypeContextInitialized = false;
+    await disposeTypeContext();
+  }
+
+  /// Retrieves the registry associated with this type.
+  ///
+  /// Throws [SubsystemNotFoundException] if no registry has been created yet.
+  SubsystemInstanceRegistryByTypeDesc getRegistry() {
+    final registry = SubsystemInstanceRegistry.findRegistryForTypeId(serviceTypeId);
     if (registry == null) {
       throw SubsystemNotFoundException(
         'No registry found for type ID: $serviceTypeId',
@@ -61,35 +79,23 @@ class SubsystemTypeDesc {
   }
 
   /// Retrieves all instantiated subsystems of this type.
-  Future<List<Subsystem>> get allInstances async {
-    final reg = await registry;
+  List<Subsystem> get allInstances {
+    final reg = getRegistry();
     return reg.allInstances;
   }
 
-  /// Synchronously retrieves all instantiated subsystems of this type matching [TSubsystem].
-  List<TSubsystem> allInstancesSync<TSubsystem extends Subsystem>() {
-    final reg = getRegistrySync();
+  /// Retrieves all instantiated subsystems of this type matching [TSubsystem].
+  List<TSubsystem> allInstancesOfType<TSubsystem extends Subsystem>() {
+    final reg = getRegistry();
     return reg.allInstancesOfType<TSubsystem>();
   }
 
-  /// Asynchronously retrieves an instance of this type by its [classId].
-  Future<TSubsystem> getInstanceByClassId<TSubsystem extends Subsystem>(String classId) async {
-    final reg = await registry;
-    final instance = await reg.findByClassId(classId);
-    if (instance == null) {
-      throw SubsystemNotFoundException(
-        'No instance found for class ID: $classId in type ID: $serviceTypeId',
-        typeId: serviceTypeId,
-        classId: classId,
-      );
-    }
-    return instance as TSubsystem;
-  }
-
-  /// Synchronously retrieves an instance of this type by its [classId].
-  TSubsystem getInstanceByClassIdSync<TSubsystem extends Subsystem>(String classId) {
-    final reg = getRegistrySync();
-    final instance = reg.findByClassIdSync(classId);
+  /// Retrieves an instance of this type by its [classId].
+  ///
+  /// Throws [SubsystemNotFoundException] if no instance with [classId] exists.
+  TSubsystem getInstanceByClassId<TSubsystem extends Subsystem>(String classId) {
+    final reg = getRegistry();
+    final instance = reg.findByClassId(classId);
     if (instance == null) {
       throw SubsystemNotFoundException(
         'No instance found for class ID: $classId in type ID: $serviceTypeId',

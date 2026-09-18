@@ -17,9 +17,18 @@ class TSubsystemFactory<TSubsystem extends Subsystem> {
   /// Builds and initializes all registered subsystems.
   ///
   /// Clears the factory by default ([flushAfter] = true).
-  Future<List<TSubsystem>> registerSubsystems({bool flushAfter = true}) async {
+  ///
+  /// If [atomicBatch] is `true`, a failure in any subsystem rolls back all
+  /// previously built instances from this batch. When `false` (the default),
+  /// only the failing instance is rolled back and successfully initialized
+  /// subsystems remain active.
+  Future<List<TSubsystem>> registerSubsystems({
+    bool flushAfter = true,
+    bool atomicBatch = false,
+  }) async {
     final out = await SubsystemInstanceRegistry.buildInstances<TSubsystem>(
       _registrations.toList(growable: false),
+      atomicBatch: atomicBatch,
     );
 
     if (flushAfter) {

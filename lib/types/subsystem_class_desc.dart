@@ -27,17 +27,11 @@ class SubsystemClassDesc {
 
   bool isValid() => serviceType.isValid() && serviceClassId.isNotEmpty;
 
-  /// Retrieves the registered instance of this subsystem (asynchronous).
-  Future<TSubsystem?> getInstance<TSubsystem extends Subsystem>() async {
+  /// Retrieves the registered instance of this subsystem.
+  ///
+  /// Returns `null` if no instance is currently registered.
+  TSubsystem? getInstance<TSubsystem extends Subsystem>() {
     return SubsystemInstanceRegistry.findSubsystemByIds<TSubsystem>(
-      serviceType.serviceTypeId,
-      serviceClassId,
-    );
-  }
-
-  /// Retrieves the registered instance of this subsystem (synchronous).
-  TSubsystem? getInstanceSync<TSubsystem extends Subsystem>() {
-    return SubsystemInstanceRegistry.findSubsystemByIdsSync<TSubsystem>(
       serviceType.serviceTypeId,
       serviceClassId,
     );

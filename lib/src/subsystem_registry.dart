@@ -7,6 +7,24 @@ class SubsystemInstanceRegistry {
   static final Map<SubsystemTypeDesc, SubsystemInstanceRegistryByTypeDesc> _registriesByTypeDesc = {};
   static final List<BuildServiceParameters> _failedRegistrations = [];
 
+  /// Configurable handler for non-fatal lifecycle errors.
+  ///
+  /// Called when a subsystem's [Subsystem.dispose] throws during teardown,
+  /// or when batch cleanup encounters secondary errors. If `null`, lifecycle
+  /// errors are silently ignored.
+  ///
+  /// ```dart
+  /// SubsystemInstanceRegistry.onLifecycleError = (error, stackTrace) {
+  ///   log('Lifecycle error: $error', stackTrace: stackTrace);
+  /// };
+  /// ```
+  static void Function(Object error, StackTrace stackTrace)? onLifecycleError;
+
+  /// Internal helper to report non-fatal lifecycle errors.
+  static void _reportLifecycleError(Object error, StackTrace stackTrace) {
+    onLifecycleError?.call(error, stackTrace);
+  }
+
   /// Returns an unmodifiable list of parameters that failed to build or initialize
   /// during the last [buildInstances] executions.
   static List<BuildServiceParameters> get lastFailedRegistrations =>
@@ -30,12 +48,19 @@ class SubsystemInstanceRegistry {
   /// initialized first sequentially to make foundational services available to
   /// asynchronous ones.
   ///
+  /// **Partial failure behavior**: If a subsystem fails during initialization or
+  /// post-initialization, only the failing instance is rolled back (disposed and
+  /// removed from the registry). Subsystems that were successfully initialized
+  /// earlier in the batch **remain active** in the registry. Set [atomicBatch]
+  /// to `true` to roll back *all* instances from the batch on any failure.
+  ///
   /// If an error occurs during initialization, the failed instance is disposed,
   /// removed from the registry, recorded in [lastFailedRegistrations], and a
   /// [SubsystemInitializationException] is thrown.
   static Future<List<TSubsystem>> buildInstances<TSubsystem extends Subsystem>(
-    List<BuildServiceParameters> paramsList,
-  ) async {
+    List<BuildServiceParameters> paramsList, {
+    bool atomicBatch = false,
+  }) async {
     final instances = <TSubsystem, BuildServiceParameters>{};
     final asyncInitInstances = <TSubsystem>[];
 
@@ -50,6 +75,9 @@ class SubsystemInstanceRegistry {
         instance = await _buildInstance<TSubsystem>(params);
       } catch (error, stackTrace) {
         _failedRegistrations.add(params);
+        if (atomicBatch) {
+          await _rollbackBatch(instances);
+        }
         throw SubsystemInitializationException(
           message: 'Failed to construct subsystem',
           parameters: params,
@@ -67,6 +95,9 @@ class SubsystemInstanceRegistry {
           } catch (error, stackTrace) {
             _failedRegistrations.add(params);
             await _cleanupFailedInstance(instance, params);
+            if (atomicBatch) {
+              await _rollbackBatch(instances);
+            }
             throw SubsystemInitializationException(
               message: 'Failed during synchronous initialization',
               parameters: params,
@@ -98,6 +129,9 @@ class SubsystemInstanceRegistry {
       if (firstError != null) {
         _failedRegistrations.add(firstError.params);
         await _cleanupFailedInstance(firstError.instance, firstError.params);
+        if (atomicBatch) {
+          await _rollbackBatch(instances);
+        }
         throw SubsystemInitializationException(
           message: 'Failed during asynchronous initialization',
           parameters: firstError.params,
@@ -117,6 +151,9 @@ class SubsystemInstanceRegistry {
       } catch (error, stackTrace) {
         _failedRegistrations.add(params);
         await _cleanupFailedInstance(instance, params);
+        if (atomicBatch) {
+          await _rollbackBatch(instances);
+        }
         throw SubsystemInitializationException(
           message: 'Failed during post-initialization',
           parameters: params,
@@ -129,11 +166,26 @@ class SubsystemInstanceRegistry {
     return instances.keys.toList();
   }
 
+  /// Rolls back all instances from a batch after a failure.
+  static Future<void> _rollbackBatch<TSubsystem extends Subsystem>(
+    Map<TSubsystem, BuildServiceParameters> instances,
+  ) async {
+    for (final entry in instances.entries) {
+      final instance = entry.key;
+      final params = entry.value;
+      try {
+        await _cleanupFailedInstance(instance, params);
+      } catch (error, stackTrace) {
+        _reportLifecycleError(error, stackTrace);
+      }
+    }
+  }
+
   static Future<void> _cleanupFailedInstance(
     Subsystem instance,
     BuildServiceParameters params,
   ) async {
-    final registry = findRegistryForTypeIdSync(params.classDescription.serviceType.serviceTypeId);
+    final registry = findRegistryForTypeId(params.classDescription.serviceType.serviceTypeId);
     if (registry != null) {
       registry._removeInstanceSilently(instance);
       try {
@@ -144,19 +196,16 @@ class SubsystemInstanceRegistry {
     }
   }
 
-  /// Synchronously finds the registry associated with [typeId].
-  static SubsystemInstanceRegistryByTypeDesc? findRegistryForTypeIdSync(String typeId) {
+  /// Finds the registry associated with [typeId].
+  ///
+  /// Returns `null` if no subsystems of this type have been registered.
+  static SubsystemInstanceRegistryByTypeDesc? findRegistryForTypeId(String typeId) {
     for (final registry in _registriesByTypeDesc.values) {
       if (registry.typeDesc.serviceTypeId == typeId) {
         return registry;
       }
     }
     return null;
-  }
-
-  /// Asynchronously finds the registry associated with [typeId].
-  static Future<SubsystemInstanceRegistryByTypeDesc?> findRegistryForTypeId(String typeId) async {
-    return findRegistryForTypeIdSync(typeId);
   }
 
   static Future<SubsystemInstanceRegistryByTypeDesc> _findOrAddRegistryForTypeDesc(
@@ -166,7 +215,7 @@ class SubsystemInstanceRegistry {
       throw ArgumentError.value(typeDesc, 'typeDesc', 'Invalid SubsystemTypeDesc provided');
     }
 
-    final existing = findRegistryForTypeIdSync(typeDesc.serviceTypeId);
+    final existing = findRegistryForTypeId(typeDesc.serviceTypeId);
     if (existing != null) {
       return existing;
     }
@@ -175,7 +224,7 @@ class SubsystemInstanceRegistry {
     await newRegistry.typeDesc._beginInitializeTypeContext();
 
     // Re-check after async gap in case another task registered it
-    final existingAfterGap = findRegistryForTypeIdSync(typeDesc.serviceTypeId);
+    final existingAfterGap = findRegistryForTypeId(typeDesc.serviceTypeId);
     if (existingAfterGap != null) {
       await newRegistry.typeDesc._beginDisposeTypeContext();
       return existingAfterGap;
@@ -186,21 +235,15 @@ class SubsystemInstanceRegistry {
   }
 
   /// Finds a subsystem singleton by its type and class IDs.
-  static Future<TSubsystem?> findSubsystemByIds<TSubsystem extends Subsystem>(
-    String typeId,
-    String classId,
-  ) async {
-    return findSubsystemByIdsSync<TSubsystem>(typeId, classId);
-  }
-
-  /// Synchronously finds a subsystem singleton by its type and class IDs.
-  static TSubsystem? findSubsystemByIdsSync<TSubsystem extends Subsystem>(
+  ///
+  /// Returns `null` if no matching instance is found.
+  static TSubsystem? findSubsystemByIds<TSubsystem extends Subsystem>(
     String typeId,
     String classId,
   ) {
-    final registry = findRegistryForTypeIdSync(typeId);
+    final registry = findRegistryForTypeId(typeId);
     if (registry != null) {
-      final singleton = registry.findByClassIdSync(classId);
+      final singleton = registry.findByClassId(classId);
       if (singleton != null && singleton is! TSubsystem) {
         throw TypeError();
       }
@@ -210,11 +253,11 @@ class SubsystemInstanceRegistry {
   }
 
   /// Finds a subsystem singleton or throws [SubsystemNotFoundException] if absent.
-  static Future<TSubsystem> findSubsystemByIdsChecked<TSubsystem extends Subsystem>(
+  static TSubsystem findSubsystemByIdsChecked<TSubsystem extends Subsystem>(
     String typeId,
     String classId,
-  ) async {
-    final registry = findRegistryForTypeIdSync(typeId);
+  ) {
+    final registry = findRegistryForTypeId(typeId);
     if (registry == null) {
       throw SubsystemNotFoundException(
         'No registry found for typeId $typeId',
@@ -223,7 +266,7 @@ class SubsystemInstanceRegistry {
       );
     }
 
-    final singleton = registry.findByClassIdSync(classId);
+    final singleton = registry.findByClassId(classId);
     if (singleton == null) {
       throw SubsystemNotFoundException(
         'No singleton found for classId $classId in typeId $typeId',
@@ -240,7 +283,7 @@ class SubsystemInstanceRegistry {
 
   /// Unregisters and disposes a subsystem by its type and class IDs.
   static Future<void> removeSubsystemByIds(String typeId, String classId) async {
-    final registry = findRegistryForTypeIdSync(typeId);
+    final registry = findRegistryForTypeId(typeId);
     if (registry != null) {
       await registry.unregisterSingletonByClassId(classId);
     }
@@ -248,7 +291,7 @@ class SubsystemInstanceRegistry {
 
   /// Clears all subsystems of a given type and disposes its type context.
   static Future<void> clearType(String typeId) async {
-    final registry = findRegistryForTypeIdSync(typeId);
+    final registry = findRegistryForTypeId(typeId);
     if (registry != null) {
       await registry._clearInternal();
       _registriesByTypeDesc.remove(registry.typeDesc);

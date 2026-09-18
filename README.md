@@ -95,17 +95,23 @@ void main() async {
 ```
 
 ### 4. Access your Subsystem
-Once initialized, you can retrieve your subsystem anywhere in your app synchronously or asynchronously.
+Once initialized, you can retrieve your subsystem anywhere in your app synchronously.
 
 ```dart
-// Synchronous retrieval
+// Synchronous retrieval via registry (throws SubsystemNotFoundException if missing)
 final api = SubsystemInstanceRegistry.findSubsystemByIdsChecked<ApiSubsystem>(
   'core.network', 
   'network.api',
 );
 
-// Or via the descriptor
-final api = apiClassDesc.getInstanceSync<ApiSubsystem>();
+// Or safe retrieval (returns null if missing)
+final maybeApi = SubsystemInstanceRegistry.findSubsystemByIds<ApiSubsystem>(
+  'core.network', 
+  'network.api',
+);
+
+// Or directly via the descriptor
+final api = apiClassDesc.getInstance<ApiSubsystem>();
 ```
 
 ## Lifecycle Phases
@@ -114,6 +120,8 @@ final api = apiClassDesc.getInstanceSync<ApiSubsystem>();
 2. **Initialization**: `initialize` -> `postInitialize` (Asynchronous)
 3. **Teardown**: `dispose` -> `finalDispose` (Asynchronous, guaranteed execution)
 
+Subclasses can call `assertNotDisposed()` at the entry of public methods to prevent usage after disposal.
+
 ## Error Handling
 
 If a subsystem throws an exception during `initialize()` or `postInitialize()`, `dart_subsystem` handles it gracefully:
@@ -121,6 +129,8 @@ If a subsystem throws an exception during `initialize()` or `postInitialize()`, 
 2. Its `dispose()` and `finalDispose()` methods are called to clean up any partial state.
 3. The original exception is bundled into a `SubsystemInitializationException` and rethrown.
 4. You can inspect failures via `SubsystemInstanceRegistry.lastFailedRegistrations`.
+5. Pass `atomicBatch: true` to `registerSubsystems(atomicBatch: true)` if you want an all-or-nothing rollback when any subsystem fails in a batch.
+6. Configure `SubsystemInstanceRegistry.onLifecycleError` to log any non-fatal errors that occur during disposal without crashing teardown pipelines.
 
 ## License
 

@@ -25,8 +25,10 @@ class SubsystemInstanceRegistryByTypeDesc {
     return instances;
   }
 
-  /// Synchronously finds a registered subsystem by its [classId].
-  Subsystem? findByClassIdSync(String classId) {
+  /// Finds a registered subsystem by its [classId].
+  ///
+  /// Returns `null` if no subsystem with [classId] is registered.
+  Subsystem? findByClassId(String classId) {
     for (final entry in _singletonsByDesc.entries) {
       if (entry.key.serviceClassId == classId) {
         return entry.value;
@@ -35,15 +37,10 @@ class SubsystemInstanceRegistryByTypeDesc {
     return null;
   }
 
-  /// Asynchronously finds a registered subsystem by its [classId].
-  Future<Subsystem?> findByClassId(String classId) async {
-    return findByClassIdSync(classId);
-  }
-
   Future<TSubsystem> _buildInstance<TSubsystem extends Subsystem>(
     BuildServiceParameters params,
   ) async {
-    final existing = findByClassIdSync(params.classDescription.serviceClassId);
+    final existing = findByClassId(params.classDescription.serviceClassId);
     if (existing != null) {
       throw StateError(
         'Singleton already registered for classId ${params.classDescription.serviceClassId}',
@@ -76,6 +73,13 @@ class SubsystemInstanceRegistryByTypeDesc {
       singleton._constructSubsystem(params);
     } catch (_) {
       _singletonsByDesc.remove(params.classDescription);
+      // L3: Dispose the partially-constructed instance to release any
+      // resources allocated by beginConstruct before postConstruct threw.
+      try {
+        await singleton._disposeSubsystem();
+      } catch (_) {
+        // Ignore secondary teardown errors
+      }
       rethrow;
     }
 
@@ -87,7 +91,7 @@ class SubsystemInstanceRegistryByTypeDesc {
     String classId, {
     bool preserveTypeContext = false,
   }) async {
-    final singleton = findByClassIdSync(classId);
+    final singleton = findByClassId(classId);
     if (singleton != null) {
       await unregisterSingleton(singleton, preserveTypeContext: preserveTypeContext);
     }
@@ -123,10 +127,18 @@ class SubsystemInstanceRegistryByTypeDesc {
     await SubsystemInstanceRegistry.clearType(typeDesc.serviceTypeId);
   }
 
+  /// B2: Disposes all singletons, continuing even if individual dispose()
+  /// calls throw. Errors are reported via [SubsystemInstanceRegistry.onLifecycleError].
   Future<void> _clearInternal() async {
     final singletons = _singletonsByDesc.values.toList();
     for (final singleton in singletons) {
-      await unregisterSingleton(singleton, preserveTypeContext: true);
+      try {
+        await unregisterSingleton(singleton, preserveTypeContext: true);
+      } catch (error, stackTrace) {
+        // Remove it from the map even if disposal failed
+        _singletonsByDesc.remove(singleton.classDesc);
+        SubsystemInstanceRegistry._reportLifecycleError(error, stackTrace);
+      }
     }
     _singletonsByDesc.clear();
     await typeDesc._beginDisposeTypeContext();

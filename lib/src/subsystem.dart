@@ -61,6 +61,20 @@ abstract class Subsystem {
   @protected
   Future<void> finalDispose() async {}
 
+  /// Throws a [StateError] if this subsystem has already been disposed.
+  ///
+  /// Subclasses can call this at the beginning of public methods to guard
+  /// against usage after disposal.
+  @protected
+  void assertNotDisposed() {
+    if (_isDisposed) {
+      throw StateError(
+        'Subsystem "${classDesc.serviceClassId}" has already been disposed '
+        'and cannot be used.',
+      );
+    }
+  }
+
   void _constructSubsystem(BuildServiceParameters params) {
     beginConstruct(params);
     postConstruct(params);
@@ -76,6 +90,13 @@ abstract class Subsystem {
     await postInitialize(params);
   }
 
+  /// Disposes this subsystem, guaranteeing [finalDispose] runs even if
+  /// [dispose] throws.
+  ///
+  /// Idempotent: repeated calls are no-ops. Errors in [dispose] are
+  /// reported via [SubsystemInstanceRegistry.onLifecycleError] rather than
+  /// propagated, so batch teardown is never interrupted by a single
+  /// subsystem's failure.
   Future<void> _disposeSubsystem() async {
     if (_isDisposed) {
       return;
@@ -83,6 +104,8 @@ abstract class Subsystem {
     _isDisposed = true;
     try {
       await dispose();
+    } catch (error, stackTrace) {
+      SubsystemInstanceRegistry._reportLifecycleError(error, stackTrace);
     } finally {
       await finalDispose();
     }
