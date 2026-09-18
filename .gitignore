@@ -1,0 +1,19 @@
+/.agent/tasks
+
+# Dart generated files
+.dart_tool/
+.packages
+.pub/
+build/
+coverage/
+**/.dart_tool/
+**/build/
+**/ephemeral/
+*.iml
+*.apk
+*.aab
+*.log
+*.session.sql
+desktop.ini
+
+doc/api/

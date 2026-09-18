@@ -1,0 +1,23 @@
+name: dart_subsystem
+version: 0.1.0
+publish_to: none
+repository: https://github.com/Yebta06/dart_subsystem
+
+description: A lightweight, lifecycle-safe framework to manage singleton subsystems and services in Dart applications.
+
+topics: 
+  - dart
+  - subsystem
+  - management
+  - lifecycle
+  - service
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  meta: ^1.10.0
+
+dev_dependencies:
+  lints: ^5.0.0
+  test: ^1.25.0
